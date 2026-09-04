@@ -1,0 +1,64 @@
+<!doctype html>
+<html>
+  <head>
+    <meta charset="utf-8" />
+    <style>
+      :root { --orange: #bf5700; --ink: #1c1c1c; --muted: #666; --line: #e6e6e6; }
+      * { box-sizing: border-box; }
+      body {
+        width: 320px; margin: 0; padding: 14px;
+        font: 13px/1.45 -apple-system, Segoe UI, Roboto, Helvetica, Arial, sans-serif;
+        color: var(--ink);
+      }
+      h1 { font-size: 14px; margin: 0 0 2px; display: flex; align-items: center; gap: 8px; }
+      h1 img { width: 20px; height: 20px; }
+      .sub { color: var(--muted); font-size: 11px; margin: 0 0 12px; }
+      .status { display: flex; align-items: center; gap: 8px; padding: 9px 11px;
+                border: 1px solid var(--line); border-radius: 10px; margin-bottom: 12px; }
+      .dot { width: 10px; height: 10px; border-radius: 50%; background: #bbb; flex: none; }
+      .dot.on { background: #1a7f37; } .dot.warn { background: #9a6700; } .dot.off { background: #cf222e; }
+      .status .label { font-weight: 600; }
+      .status .detail { color: var(--muted); font-size: 11px; margin-left: auto; }
+      .course { border: 1px solid var(--line); border-radius: 10px; padding: 9px 11px; margin-bottom: 8px; }
+      .course .cid { font-weight: 600; }
+      .course .meta { color: var(--muted); font-size: 11px; margin-top: 2px; }
+      .empty { color: var(--muted); font-size: 12px; padding: 8px 0 14px; }
+      .row { display: flex; gap: 8px; margin-top: 6px; }
+      button {
+        flex: 1; padding: 8px 10px; border-radius: 8px; border: 1px solid var(--line);
+        background: #fafafa; cursor: pointer; font-size: 12px; font-weight: 600; color: var(--ink);
+      }
+      button.primary { background: var(--orange); border-color: var(--orange); color: #fff; }
+      button:active { transform: translateY(1px); }
+      .foot { color: var(--muted); font-size: 10.5px; margin-top: 12px; border-top: 1px solid var(--line); padding-top: 8px; }
+    </style>
+  </head>
+  <body>
+    <h1><img src="icons/icon48.png" alt="" /> Instapoll Notifier</h1>
+    <p class="sub">Open a course page to arm it, then switch tabs freely.</p>
+
+    <div class="status">
+      <span id="dot" class="dot"></span>
+      <span id="statusLabel" class="label">…</span>
+      <span id="statusDetail" class="detail"></span>
+    </div>
+
+    <div id="courses"></div>
+    <div id="empty" class="empty" hidden>
+      No course armed yet. Open an Instapoll course page
+      (…/course/&lt;id&gt;/student) and it will appear here.
+    </div>
+
+    <div class="row">
+      <button id="test" class="primary">Send test alert</button>
+      <button id="reconnect">Reconnect</button>
+    </div>
+
+    <p class="foot">
+      Realtime via the extension's own Pusher connection (not tab polling).
+      Alerts fire even when this popup and the course tab are closed/backgrounded.
+    </p>
+
+    <script src="popup.js"></script>
+  </body>
+</html>

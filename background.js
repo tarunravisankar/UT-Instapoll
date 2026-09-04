@@ -1,0 +1,392 @@
+// ============================================================================
+// UT Instapoll Notifier — service worker
+//
+// Design summary (see README for the full rationale):
+//   The extension does NOT rely on sniffing the Instapoll page's own Pusher
+//   connection. A background tab's JavaScript timers get throttled by Chrome,
+//   which can silently kill the page's Pusher heartbeat after a few minutes and
+//   make you MISS a poll — exactly the situation this extension exists to avoid.
+//
+//   Instead, the service worker opens its OWN WebSocket to the same public
+//   Pusher endpoint and subscribes to each open course's public channel. Service
+//   worker timers are not throttled the way background-tab timers are, and a
+//   20s keepalive ping keeps both the Pusher connection and the SW itself alive
+//   (supported since Chrome 116). This is still true realtime — not polling.
+//
+//   An open Instapoll course tab is what "arms" a course (we read the course ID
+//   from its URL). You can then switch away; alerts fire from here regardless of
+//   which tab is focused. If the tab is later frozen/closed, monitoring keeps
+//   running and clicking a notification re-opens the course URL.
+// ============================================================================
+
+const PUSHER_URL =
+  'wss://pusher-ws.la.utexas.edu/app/instapollprod?protocol=7&client=js&version=8.6.0&flash=false';
+
+const KEEPALIVE_MS = 20_000;   // must be < 30s SW idle window and < Pusher activity_timeout
+const SEEN_TTL_MS = 12 * 60 * 60 * 1000; // forget a poll id after 12h
+const STORAGE_KEY = 'instapoll_state';
+
+// ---- runtime state (rebuilt from storage on SW start) -----------------------
+let ws = null;
+let wsState = 'idle';          // idle | connecting | connected | closed
+let keepaliveTimer = null;
+let reconnectTimer = null;
+let reconnectAttempts = 0;
+let lastConnectedAt = 0;
+let lastEventAt = 0;
+
+// Persisted-ish state. `tabs` maps tabId -> {courseId, url, windowId}.
+// `seen` maps "courseId:pollId" -> timestamp (dedup across reloads/reconnects).
+let state = { tabs: {}, seen: {} };
+
+// notificationId -> {courseId, url} so clicks can focus/open the right tab
+const notifTargets = {};
+
+// ---------------------------------------------------------------------------
+// persistence
+// ---------------------------------------------------------------------------
+async function loadState() {
+  const got = await chrome.storage.local.get(STORAGE_KEY);
+  if (got[STORAGE_KEY]) state = { tabs: {}, seen: {}, ...got[STORAGE_KEY] };
+}
+async function saveState() {
+  await chrome.storage.local.set({ [STORAGE_KEY]: state });
+}
+
+function activeCourseIds() {
+  return [...new Set(Object.values(state.tabs).map((t) => t.courseId))];
+}
+function channelFor(courseId) {
+  return `polls_course_${courseId}`;
+}
+function courseIdFromChannel(channel) {
+  const m = /^polls_course_(\d+)$/.exec(channel || '');
+  return m ? m[1] : null;
+}
+
+// ---------------------------------------------------------------------------
+// WebSocket lifecycle
+// ---------------------------------------------------------------------------
+function ensureConnection() {
+  if (activeCourseIds().length === 0) return; // nothing to monitor
+  if (ws && (ws.readyState === WebSocket.OPEN || ws.readyState === WebSocket.CONNECTING)) return;
+  connect();
+}
+
+function connect() {
+  clearTimeout(reconnectTimer);
+  wsState = 'connecting';
+  updateBadge();
+  try {
+    ws = new WebSocket(PUSHER_URL);
+  } catch (e) {
+    scheduleReconnect();
+    return;
+  }
+  ws.onopen = () => { /* wait for pusher:connection_established before subscribing */ };
+  ws.onmessage = onWsMessage;
+  ws.onerror = () => { /* an onclose will follow */ };
+  ws.onclose = () => {
+    wsState = 'closed';
+    stopKeepalive();
+    updateBadge();
+    if (activeCourseIds().length > 0) scheduleReconnect();
+  };
+}
+
+function scheduleReconnect() {
+  clearTimeout(reconnectTimer);
+  const delay = Math.min(30_000, 1000 * Math.pow(2, reconnectAttempts));
+  reconnectAttempts++;
+  reconnectTimer = setTimeout(connect, delay);
+}
+
+function send(obj) {
+  if (ws && ws.readyState === WebSocket.OPEN) ws.send(JSON.stringify(obj));
+}
+
+function subscribeAll() {
+  for (const courseId of activeCourseIds()) {
+    send({ event: 'pusher:subscribe', data: { channel: channelFor(courseId), auth: '' } });
+  }
+}
+
+function startKeepalive() {
+  stopKeepalive();
+  keepaliveTimer = setInterval(() => send({ event: 'pusher:ping', data: {} }), KEEPALIVE_MS);
+}
+function stopKeepalive() {
+  if (keepaliveTimer) clearInterval(keepaliveTimer);
+  keepaliveTimer = null;
+}
+
+function onWsMessage(evt) {
+  let frame;
+  try { frame = JSON.parse(evt.data); } catch { return; }
+  const event = frame.event;
+
+  if (event === 'pusher:connection_established') {
+    wsState = 'connected';
+    lastConnectedAt = Date.now();
+    reconnectAttempts = 0;
+    updateBadge();
+    subscribeAll();
+    startKeepalive();
+    return;
+  }
+  if (event === 'pusher:ping') { send({ event: 'pusher:pong', data: {} }); return; }
+  if (event === 'pusher:pong') { return; }
+  if (event === 'pusher_internal:subscription_succeeded') { return; }
+  if (event === 'pusher:error') { console.warn('[Instapoll] pusher error', frame.data); return; }
+
+  if (event === 'poll_released') {
+    handlePollReleased(frame);
+  }
+}
+
+// ---------------------------------------------------------------------------
+// poll handling + dedup
+// ---------------------------------------------------------------------------
+async function handlePollReleased(frame) {
+  lastEventAt = Date.now();
+  const courseId = courseIdFromChannel(frame.channel) || 'unknown';
+
+  let pollId = 'unknown';
+  try {
+    const data = typeof frame.data === 'string' ? JSON.parse(frame.data) : frame.data;
+    if (data && data.poll && data.poll.id != null) pollId = String(data.poll.id);
+  } catch { /* keep 'unknown' */ }
+
+  const key = `${courseId}:${pollId}`;
+  if (pollId !== 'unknown' && state.seen[key]) return; // duplicate — ignore
+  state.seen[key] = Date.now();
+  await saveState();
+
+  await notifyPoll(courseId, pollId);
+}
+
+async function notifyPoll(courseId, pollId) {
+  const target = targetForCourse(courseId);
+  const notifId = `instapoll_${courseId}_${pollId}_${Date.now()}`;
+  notifTargets[notifId] = { courseId, url: target.url };
+
+  chrome.notifications.create(notifId, {
+    type: 'basic',
+    iconUrl: chrome.runtime.getURL('icons/icon128.png'),
+    title: '📊 New Instapoll released!',
+    message: `Course ${courseId} — a poll is open. Click to answer.`,
+    priority: 2,
+    requireInteraction: true, // stays on screen until you act on it
+  });
+
+  await playAlertSound();
+}
+
+function targetForCourse(courseId) {
+  for (const [tabId, t] of Object.entries(state.tabs)) {
+    if (t.courseId === courseId) return { tabId: Number(tabId), url: t.url, windowId: t.windowId };
+  }
+  return { tabId: null, url: `https://polls.la.utexas.edu/course/${courseId}/student#`, windowId: null };
+}
+
+// ---------------------------------------------------------------------------
+// audio via offscreen document (SW has no Audio API)
+// ---------------------------------------------------------------------------
+async function ensureOffscreen() {
+  const existing = await chrome.runtime.getContexts({ contextTypes: ['OFFSCREEN_DOCUMENT'] });
+  if (existing.length > 0) return;
+  await chrome.offscreen.createDocument({
+    url: 'offscreen.html',
+    reasons: ['AUDIO_PLAYBACK'],
+    justification: 'Play an audible alert when a poll is released.',
+  });
+}
+async function playAlertSound() {
+  try {
+    await ensureOffscreen();
+    await chrome.runtime.sendMessage({ target: 'offscreen', type: 'PLAY_ALERT' });
+  } catch (e) {
+    console.warn('[Instapoll] could not play sound', e);
+  }
+}
+
+// ---------------------------------------------------------------------------
+// notification click -> focus the course tab, or open it
+// ---------------------------------------------------------------------------
+chrome.notifications.onClicked.addListener(async (notifId) => {
+  const tgt = notifTargets[notifId];
+  chrome.notifications.clear(notifId);
+  if (!tgt) return;
+
+  // Prefer focusing a live tab for this course.
+  for (const [tabId, t] of Object.entries(state.tabs)) {
+    if (t.courseId === tgt.courseId) {
+      try {
+        await chrome.tabs.update(Number(tabId), { active: true });
+        if (t.windowId != null) await chrome.windows.update(t.windowId, { focused: true });
+        return;
+      } catch { /* tab gone — fall through to open */ }
+    }
+  }
+  chrome.tabs.create({ url: tgt.url });
+});
+
+// ---------------------------------------------------------------------------
+// badge
+// ---------------------------------------------------------------------------
+function updateBadge() {
+  const monitoring = activeCourseIds().length > 0;
+  if (!monitoring) {
+    chrome.action.setBadgeText({ text: '' });
+    return;
+  }
+  const ok = wsState === 'connected';
+  chrome.action.setBadgeText({ text: ok ? '●' : '…' });
+  chrome.action.setBadgeBackgroundColor({ color: ok ? '#1a7f37' : '#9a6700' });
+}
+
+// ---------------------------------------------------------------------------
+// messages from content scripts + popup
+// ---------------------------------------------------------------------------
+chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
+  (async () => {
+    if (msg.type === 'COURSE_ACTIVE') {
+      const tab = sender.tab;
+      if (tab && msg.courseId) {
+        state.tabs[tab.id] = { courseId: msg.courseId, url: msg.url, windowId: tab.windowId };
+        await saveState();
+        // if already connected, make sure we're subscribed to this channel
+        if (wsState === 'connected') {
+          send({ event: 'pusher:subscribe', data: { channel: channelFor(msg.courseId), auth: '' } });
+        }
+        ensureConnection();
+        updateBadge();
+      }
+      sendResponse({ ok: true });
+      return;
+    }
+
+    if (msg.type === 'GET_STATUS') {
+      sendResponse(buildStatus());
+      return;
+    }
+
+    if (msg.type === 'TEST_ALERT') {
+      // Simulate an inbound poll_released so the full pipeline (dedup + notify +
+      // sound + click-to-focus) is exercised without a real professor.
+      const courseId = msg.courseId || activeCourseIds()[0] || '0000';
+      const fakeId = `test-${Date.now()}`;
+      await notifyPoll(courseId, fakeId);
+      sendResponse({ ok: true, courseId });
+      return;
+    }
+
+    if (msg.type === 'RECONNECT_NOW') {
+      try { ws && ws.close(); } catch {}
+      reconnectAttempts = 0;
+      ensureConnection();
+      sendResponse({ ok: true });
+      return;
+    }
+  })();
+  return true; // async response
+});
+
+function buildStatus() {
+  const courses = activeCourseIds().map((courseId) => {
+    const tabIds = Object.entries(state.tabs)
+      .filter(([, t]) => t.courseId === courseId)
+      .map(([id]) => Number(id));
+    const seenCount = Object.keys(state.seen).filter((k) => k.startsWith(courseId + ':')).length;
+    return { courseId, channel: channelFor(courseId), tabs: tabIds.length, seenCount };
+  });
+  return {
+    wsState,
+    monitoring: courses.length > 0,
+    courses,
+    lastConnectedAt,
+    lastEventAt,
+  };
+}
+
+// ---------------------------------------------------------------------------
+// tab close -> drop course, maybe unsubscribe
+// (chrome.tabs.onRemoved works without the "tabs" permission)
+// ---------------------------------------------------------------------------
+chrome.tabs.onRemoved.addListener(async (tabId) => {
+  if (!state.tabs[tabId]) return;
+  const courseId = state.tabs[tabId].courseId;
+  delete state.tabs[tabId];
+  await saveState();
+
+  const stillMonitored = activeCourseIds().includes(courseId);
+  if (!stillMonitored && wsState === 'connected') {
+    send({ event: 'pusher:unsubscribe', data: { channel: channelFor(courseId) } });
+  }
+  if (activeCourseIds().length === 0) {
+    stopKeepalive();
+    try { ws && ws.close(); } catch {}
+  }
+  updateBadge();
+});
+
+// ---------------------------------------------------------------------------
+// watchdog: wakes the SW after sleep/termination and revives the connection;
+// also expires old seen-poll ids
+// ---------------------------------------------------------------------------
+chrome.alarms.create('watchdog', { periodInMinutes: 1 });
+chrome.alarms.onAlarm.addListener(async (alarm) => {
+  if (alarm.name !== 'watchdog') return;
+  await loadState();
+
+  // expire stale dedup entries
+  const now = Date.now();
+  let changed = false;
+  for (const [k, ts] of Object.entries(state.seen)) {
+    if (now - ts > SEEN_TTL_MS) { delete state.seen[k]; changed = true; }
+  }
+  if (changed) await saveState();
+
+  ensureConnection();
+  updateBadge();
+});
+
+// ---------------------------------------------------------------------------
+// startup
+// ---------------------------------------------------------------------------
+chrome.runtime.onInstalled.addListener(() => { init(); });
+chrome.runtime.onStartup.addListener(() => { init(); });
+
+async function reconcileTabs() {
+  // Drop stored course tabs that no longer exist (e.g. closed while the SW was
+  // terminated). chrome.tabs.query returns ids without the "tabs" permission.
+  try {
+    const live = new Set((await chrome.tabs.query({})).map((t) => t.id));
+    let changed = false;
+    for (const id of Object.keys(state.tabs)) {
+      if (!live.has(Number(id))) { delete state.tabs[id]; changed = true; }
+    }
+    if (changed) await saveState();
+  } catch { /* ignore */ }
+}
+
+async function init() {
+  await loadState();
+  await reconcileTabs();
+  ensureConnection();
+  updateBadge();
+}
+
+// Debug hook — call from the service worker's DevTools console to push a
+// synthetic poll_released frame through the REAL pipeline (parse + dedup +
+// notify + sound). Example:  __simulatePoll(6609, 999001)
+// Run it twice with the same id to watch dedup suppress the second alert.
+globalThis.__simulatePoll = (courseId, pollId = Date.now()) =>
+  handlePollReleased({
+    event: 'poll_released',
+    channel: `polls_course_${courseId}`,
+    data: JSON.stringify({ poll: { id: pollId } }),
+  });
+
+// Run on every SW spin-up too (module top-level).
+init();
