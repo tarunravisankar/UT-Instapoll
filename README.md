@@ -187,6 +187,13 @@ world, so `content.js` now hands over explicitly: the incoming copy calls
 copy stands down on its own the first time it notices the context is gone.
 Exactly one live listener per frame, and a dead copy can never keep the tab.
 
+Injecting a fresh copy does not silence an old one, and a copy from before that
+handover left no handle to retire it by — it just keeps throwing on every tab
+switch for as long as the page lives. So the worker reloads open course tabs on
+**install/update only**, which is the one moment a stale script is guaranteed to
+be sitting in them. It never reloads a page on a worker restart or browser
+start.
+
 1. Open your course through Canvas and keep the student course tab open.
 2. Click the extension icon and select your course.
 3. Read the question, select or type your answer, then click **Submit answer**.

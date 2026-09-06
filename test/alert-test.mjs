@@ -12,7 +12,7 @@ const COURSE_TAB = { id: 7, windowId: 1, url: 'https://polls.la.utexas.edu/cours
 function harness({ polls, focused = true, openPopup = true } = {}) {
   const log = {
     created: [], updated: [], chimes: 0, popupOpens: 0,
-    activated: [], createdTabs: [], injected: [],
+    activated: [], createdTabs: [], injected: [], reloaded: [],
   };
   const store = {
     [STORAGE_KEY]: {
@@ -51,6 +51,7 @@ function harness({ polls, focused = true, openPopup = true } = {}) {
     },
     tabs: {
       query: async () => [COURSE_TAB],
+      async reload(id) { log.reloaded.push(id); },
       async sendMessage(tabId, msg) {
         if (tabId !== COURSE_TAB.id) throw new Error('no such tab');
         if (msg.type === 'PING') return { ok: true, courseId: '6609' };
@@ -211,4 +212,24 @@ const settle = () => new Promise(resolve => setTimeout(resolve, 30));
     'an orphaned notification must still open the course page');
 }
 
-console.log('Alert tests passed (cross-tab chime, question text, popup, buttons, dedup, orphan click).');
+// ---------------------------------------------------------------------------
+// Install/update evicts stale content scripts; a plain worker start does not.
+//
+// A content script from before the dispose() handover cannot be retired from
+// the worker, so the only way to stop it throwing into the page is to reload
+// the tab. That must not happen on every service worker spin-up.
+// ---------------------------------------------------------------------------
+{
+  const { log, listeners } = harness({ polls: null });
+  await settle();
+  assert.deepEqual(log.reloaded, [],
+    'a worker restart must never reload a course tab');
+
+  await listeners.installed();
+  await settle();
+  assert.deepEqual(log.reloaded, [7],
+    'install/update must reload course tabs to evict a stale content script');
+}
+
+console.log('Alert tests passed (cross-tab chime, question text, popup, buttons, '
+  + 'dedup, orphan click, stale-script eviction).');

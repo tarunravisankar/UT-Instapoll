@@ -1,7 +1,7 @@
 {
   "manifest_version": 3,
   "name": "UT Instapoll Notifier",
-  "version": "1.2.1",
+  "version": "1.2.2",
   "description": "Alerts you when UT Instapoll polls open and lets you view questions and submit answers from the extension.",
   "minimum_chrome_version": "116",
   "permissions": [

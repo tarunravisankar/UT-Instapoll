@@ -113,6 +113,23 @@ async function healOpenTabs() {
   await Promise.all(tabs.map((t) => t.id != null && ensureContentScript(t.id)));
 }
 
+// Injecting a fresh copy does not silence an old one. A content script from a
+// previous version keeps its listeners bound to the page, and once its context
+// dies every tab switch throws "Extension context invalidated" from a closure
+// we hold no reference to. Copies from v1.2.1 on hand over via dispose(); older
+// ones left no handle at all, so the page has to be reloaded to evict them.
+//
+// This runs ONLY on install/update -- never on a worker restart or browser
+// start -- so a page is never disturbed while the extension is just running.
+async function reloadCourseTabs() {
+  let tabs = [];
+  try { tabs = await chrome.tabs.query({ url: COURSE_URL_MATCH }); } catch { return; }
+  for (const tab of tabs) {
+    if (tab.id == null) continue;
+    try { await chrome.tabs.reload(tab.id); } catch { /* gone, or not ours to touch */ }
+  }
+}
+
 // ---------------------------------------------------------------------------
 // WebSocket lifecycle
 // ---------------------------------------------------------------------------
@@ -558,7 +575,9 @@ chrome.alarms.onAlarm.addListener(async (alarm) => {
 // ---------------------------------------------------------------------------
 // startup
 // ---------------------------------------------------------------------------
-chrome.runtime.onInstalled.addListener(() => { init(); });
+// Install/update is the one moment a stale content script from the previous
+// version is guaranteed to be sitting in every open course tab.
+chrome.runtime.onInstalled.addListener(() => { reloadCourseTabs().then(init, init); });
 chrome.runtime.onStartup.addListener(() => { init(); });
 
 async function reconcileTabs() {
