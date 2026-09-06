@@ -6,7 +6,7 @@ sound — even when the Instapoll tab is in the background and you're working in
 another tab. Clicking the notification jumps you to the course tab so you can
 answer.
 
-It does **not** auto-answer or submit anything.
+Open the toolbar popup to view active poll questions and submit your own answers. It supports multiple choice, text entry, and attendance. Answers are sent only when you click **Submit answer** (or **Update answer**).
 
 ---
 
@@ -133,3 +133,55 @@ exercised live is an actual inbound `poll_released` — which #3 covers offline.
 **Permissions used:** `notifications`, `storage`, `alarms`, `offscreen`, and host
 access to `polls.la.utexas.edu` and `pusher-ws.la.utexas.edu`. No `tabs`
 permission — tab focusing uses the sender's own tab id.
+
+## Answer polls from the extension
+
+After updating the extension, reload it at chrome://extensions, then reload your
+signed-in Instapoll student course tabs so the new content script is available.
+
+1. Open your course through Canvas and keep the student course tab open.
+2. Click the extension icon and select your course.
+3. Read the question, select or type your answer, then click **Submit answer**.
+4. Wait for **Answer submitted successfully.** You can update an answer while
+   the poll remains open. Attendance requires explicitly confirming that you are
+   present and following your instructor's attendance policy.
+
+The popup refreshes active polls every five seconds while open. Refreshes preserve
+your draft unless the question changes. Drafts are discarded when you close the
+popup or switch courses. If submission cannot be confirmed, check the course page
+before trying again; the extension never automatically retries a submission.
+
+Requests use the signed-in tab's session and CSRF token. No new permissions are
+required and answers are not saved in extension storage. Closed/recalled polls,
+changed questions, invalid answers, expired sessions, and server errors are handled.
+Instructor-hidden prompts remain hidden. Basic prompt formatting and HTTPS images
+are supported; math markup is displayed as source text, so use **Open course page**
+for full MathJax rendering. Existing desktop notifications still open the course tab.
+
+### API verification and tests
+
+The adapter follows UT's publicly served student client:
+https://polls.la.utexas.edu/build/manifest.json
+(student entry inspected September 6, 2026). It uses these same-origin endpoints:
+
+- GET /api/v1/student/course/{courseId}/poll
+- GET /api/v1/student/course/{courseId}/poll/{pollId}
+- POST /api/v1/student/course/{courseId}/poll/{pollId}/response
+
+Responses use response_text: a zero-based choice index as a string, free text,
+or "present" for attendance. Only a matching saved server response is shown as
+success. The server remains authoritative for course access and poll availability.
+
+Run the offline checks:
+
+    node test/parse-test.mjs
+    node test/poll-api-test.mjs
+    node test/popup-test.mjs
+
+The API test executes the actual content script with mocked Chrome and fetch APIs;
+it does not contact UT or submit live answers. Live verification still requires a
+signed-in course and an active poll. Check each answer type, updating an answer,
+closing/recalling a poll, multiple courses, expired login, and loss of connectivity.
+
+New files: poll-model.js (shared validation) and popup.css (popup styling).
+content.js now handles authenticated poll loading/submission as well as arming alerts.

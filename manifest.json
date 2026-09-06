@@ -1,8 +1,8 @@
 {
   "manifest_version": 3,
   "name": "UT Instapoll Notifier",
-  "version": "1.0.0",
-  "description": "Alerts you the moment a UT Austin Instapoll poll is released, even when the tab is in the background.",
+  "version": "1.1.1",
+  "description": "Alerts you when UT Instapoll polls open and lets you view questions and submit answers from the extension.",
   "minimum_chrome_version": "116",
   "permissions": [
     "notifications",
@@ -21,7 +21,7 @@
   "content_scripts": [
     {
       "matches": ["*://polls.la.utexas.edu/course/*"],
-      "js": ["content.js"],
+      "js": ["poll-model.js", "content.js"],
       "run_at": "document_start"
     }
   ],

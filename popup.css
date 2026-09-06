@@ -1,0 +1,28 @@
+:root { --orange:#bf5700; --ink:#222; --muted:#666; --line:#ddd; }
+* { box-sizing:border-box; }
+body { width:390px; margin:0; padding:16px; color:var(--ink); font:13px/1.5 system-ui,sans-serif; }
+header { display:flex; align-items:center; gap:10px; margin-bottom:14px; }
+header img { width:32px; height:32px; }
+h1 { font-size:18px; margin:0; } header p { margin:0; color:var(--muted); }
+.status { display:flex; align-items:center; gap:8px; background:#f6f6f6; padding:9px; border-radius:8px; margin-bottom:14px; }
+.dot { width:9px; height:9px; border-radius:50%; background:#9a6700; }
+.dot.on { background:#1a7f37; } .dot.off { background:#b42318; }
+.course-label { display:block; font-weight:600; margin-bottom:4px; }
+select,textarea { width:100%; padding:8px; font:inherit; border:1px solid var(--line); border-radius:6px; }
+textarea { resize:vertical; min-height:90px; }
+.row { display:flex; gap:8px; margin-top:8px; }
+button { padding:8px 10px; border:1px solid var(--line); border-radius:7px; background:#fafafa; color:var(--ink); font:600 12px system-ui,sans-serif; cursor:pointer; }
+.row button { flex:1; } button.primary { background:var(--orange); border-color:var(--orange); color:white; width:100%; margin-top:10px; }
+button:disabled { opacity:.55; cursor:default; }
+:focus-visible { outline:2px solid var(--orange); outline-offset:2px; }
+.poll { padding:12px; margin:12px 0; border:1px solid var(--line); border-radius:10px; }
+h2 { font-size:15px; margin:0; overflow-wrap:anywhere; }
+.meta,footer { color:var(--muted); font-size:11px; } .meta { margin:3px 0 10px; }
+.prompt { overflow-wrap:anywhere; margin:8px 0; } .prompt img { max-width:100%; height:auto; } .prompt pre { white-space:pre-wrap; } .prompt table { max-width:100%; }
+fieldset { border:0; padding:0; margin:0; min-width:0; }
+legend { font-weight:600; margin-bottom:6px; }
+.choice { display:flex; align-items:flex-start; gap:8px; padding:8px; margin:5px 0; background:#f7f7f7; border-radius:6px; overflow-wrap:anywhere; }
+.choice input { flex-shrink:0; margin-top:4px; }
+.feedback { margin:8px 0 0; font-size:12px; overflow-wrap:anywhere; }
+.error { color:#b42318; } .success { color:#1a7f37; }
+footer { border-top:1px solid var(--line); padding-top:8px; margin-top:16px; }
