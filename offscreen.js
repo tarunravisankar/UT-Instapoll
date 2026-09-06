@@ -32,8 +32,12 @@ async function playAlert() {
   for (const [at, f] of pattern) beep(at, f, 220, 0.25);
 }
 
-chrome.runtime.onMessage.addListener((msg) => {
-  if (msg && msg.target === 'offscreen' && msg.type === 'PLAY_ALERT') {
-    playAlert();
-  }
+// Acknowledge the message. Without a response the worker's sendMessage rejects
+// with "message port closed" even though the chime played, which makes a
+// delivery failure indistinguishable from success and breaks any retry.
+chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
+  if (!msg || msg.target !== 'offscreen' || msg.type !== 'PLAY_ALERT') return false;
+  playAlert();
+  sendResponse({ ok: true });
+  return false;
 });

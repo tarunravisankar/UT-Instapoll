@@ -73,6 +73,31 @@ Requires Chrome 116 or newer.
 > even if the course tab is muted/backgrounded. If you never hear it, check that
 > Chrome itself isn't muted at the OS level.
 
+## What happens when a poll drops
+
+You do not need to be on the Instapoll tab — the WebSocket lives in the service
+worker, not the page, so all of this fires from any tab, any window:
+
+1. **The chime plays** immediately, from the offscreen document.
+2. **A desktop notification appears** with two actions — *Answer here* opens the
+   extension popup, *Open course page* focuses (or reopens) the course tab.
+   Clicking the notification body does the same as *Open course page*.
+3. **The question text is filled into the notification** a moment later. The
+   worker has no Instapoll session of its own, so it asks a course tab to fetch
+   the poll. This is deliberately *after* the alert — the alert is never delayed
+   by a network round trip, and a poll with no reachable tab still alerts, just
+   with the generic "a poll is open" wording.
+4. **The popup opens by itself** if Chrome already has focus, showing the
+   question and an answer form. This is best effort: `chrome.action.openPopup()`
+   needs a focused Chrome window and Chrome 127+. When it can't run, the
+   notification is still there and still actionable.
+
+> **macOS note:** Chrome hands notifications to the system Notification Center,
+> which does not honour `requireInteraction` — the banner auto-dismisses into
+> Notification Center instead of staying on screen, and the two action buttons
+> only appear when you expand the banner. The chime and the auto-opened popup
+> are the reliable signals there.
+
 ---
 
 ## Testing without waiting for a professor
@@ -132,6 +157,7 @@ exercised live is an actual inbound `poll_released` — which #3 covers offline.
 | `test/poll-api-test.mjs` | Content-script request/validation tests |
 | `test/popup-test.mjs` | Popup rendering and submit-flow tests |
 | `test/recovery-test.mjs` | Orphaned-tab repair, re-injection guard, no submit replay |
+| `test/alert-test.mjs` | Runs the real worker: chime, notification, question text, buttons |
 | `icons/` | Toolbar & notification icons |
 
 **Permissions used:** `notifications`, `storage`, `alarms`, `offscreen`,

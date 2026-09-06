@@ -220,16 +220,85 @@ async function notifyPoll(courseId, pollId) {
   state.notifs[notifId] = { courseId, url: target.url, at: Date.now() };
   await saveState();
 
+  // Fire the alert before looking anything up. Reading the question needs a
+  // network round trip through a course tab, and being late to a poll is the
+  // one failure this extension exists to prevent.
   chrome.notifications.create(notifId, {
     type: 'basic',
     iconUrl: chrome.runtime.getURL('icons/icon128.png'),
     title: '📊 New Instapoll released!',
     message: `Course ${courseId} — a poll is open. Click to answer.`,
+    contextMessage: `Course ${courseId}`,
     priority: 2,
     requireInteraction: true, // stays on screen until you act on it
+    buttons: [{ title: 'Answer here' }, { title: 'Open course page' }],
   });
 
   await playAlertSound();
+  // Surface the question without stealing the tab: this only lands when a
+  // Chrome window already has focus, which is the "reading another tab" case.
+  await openActionPopup();
+  await describeInNotification(notifId, courseId, pollId);
+}
+
+// ---------------------------------------------------------------------------
+// filling the question into the notification
+//
+// The service worker has no Instapoll session of its own, so the poll text has
+// to come from a course tab. Entirely best effort: if no tab can answer, the
+// generic alert above stands on its own.
+// ---------------------------------------------------------------------------
+function textFromHtml(html) {
+  return String(html || '')
+    .replace(/<br\s*\/?>/gi, ' ')
+    .replace(/<\/(p|div|li|tr|h[1-6])\s*>/gi, ' ')
+    .replace(/<[^>]*>/g, '')
+    .replace(/&nbsp;/gi, ' ').replace(/&lt;/gi, '<').replace(/&gt;/gi, '>')
+    .replace(/&quot;/gi, '"').replace(/&#39;/gi, "'").replace(/&amp;/gi, '&')
+    .replace(/\s+/g, ' ')
+    .trim();
+}
+
+async function pollDetails(courseId, pollId) {
+  const tabIds = Object.entries(state.tabs)
+    .filter(([, t]) => t.courseId === courseId)
+    .map(([id]) => Number(id));
+  for (const tabId of tabIds) {
+    try {
+      if (!await ensureContentScript(tabId)) continue;
+      const reply = await chrome.tabs.sendMessage(tabId, { type: 'GET_POLLS', courseId });
+      if (!reply || !reply.ok || !Array.isArray(reply.polls)) continue;
+      return reply.polls.find((p) => p.id === String(pollId))
+        || reply.polls.find((p) => p.state === 'sent')
+        || null;
+    } catch { /* try the next tab */ }
+  }
+  return null;
+}
+
+async function describeInNotification(notifId, courseId, pollId) {
+  let poll = null;
+  try { poll = await pollDetails(courseId, pollId); } catch { /* keep generic */ }
+  if (!poll) return;
+  const question = textFromHtml(poll.prompt);
+  const options = {};
+  if (poll.name) options.title = `📊 ${poll.name}`;
+  if (question) options.message = question.length > 200 ? question.slice(0, 197) + '…' : question;
+  if (Object.keys(options).length === 0) return;
+  try { await chrome.notifications.update(notifId, options); } catch { /* already dismissed */ }
+}
+
+// Opening our own popup needs a focused Chrome window, and action.openPopup()
+// only reached stable in Chrome 127. Both are treated as best effort — the
+// desktop notification is the alert that always works.
+async function openActionPopup() {
+  if (typeof chrome.action?.openPopup !== 'function') return false;
+  try {
+    const win = await chrome.windows.getLastFocused();
+    if (!win || win.focused === false) return false;
+    await chrome.action.openPopup({ windowId: win.id });
+    return true;
+  } catch { return false; }
 }
 
 function targetForCourse(courseId) {
@@ -242,28 +311,50 @@ function targetForCourse(courseId) {
 // ---------------------------------------------------------------------------
 // audio via offscreen document (SW has no Audio API)
 // ---------------------------------------------------------------------------
-async function ensureOffscreen() {
-  const existing = await chrome.runtime.getContexts({ contextTypes: ['OFFSCREEN_DOCUMENT'] });
-  if (existing.length > 0) return;
-  await chrome.offscreen.createDocument({
-    url: 'offscreen.html',
-    reasons: ['AUDIO_PLAYBACK'],
-    justification: 'Play an audible alert when a poll is released.',
-  });
+// Two alerts arriving together used to race here: both saw no document and both
+// called createDocument, and the loser threw. Serialise on one promise.
+let offscreenReady = null;
+function ensureOffscreen() {
+  if (offscreenReady) return offscreenReady;
+  offscreenReady = (async () => {
+    const existing = await chrome.runtime.getContexts({ contextTypes: ['OFFSCREEN_DOCUMENT'] });
+    if (existing.length > 0) return;
+    try {
+      await chrome.offscreen.createDocument({
+        url: 'offscreen.html',
+        reasons: ['AUDIO_PLAYBACK'],
+        justification: 'Play an audible alert when a poll is released.',
+      });
+    } catch (e) {
+      // A concurrent caller may have created it first; anything else is real.
+      if (!/single offscreen document/i.test(String(e && e.message))) throw e;
+    }
+  })();
+  offscreenReady = offscreenReady.catch((e) => { offscreenReady = null; throw e; });
+  return offscreenReady;
 }
 async function playAlertSound() {
-  try {
-    await ensureOffscreen();
-    await chrome.runtime.sendMessage({ target: 'offscreen', type: 'PLAY_ALERT' });
-  } catch (e) {
-    console.warn('[Instapoll] could not play sound', e);
+  // The document can be torn down between alerts, and a freshly created one may
+  // not have registered its listener yet. Retry, but only on a real rejection:
+  // offscreen.js acknowledges the message, so a resolve means the chime played.
+  for (let attempt = 0; attempt < 3; attempt++) {
+    try {
+      await ensureOffscreen();
+      await chrome.runtime.sendMessage({ target: 'offscreen', type: 'PLAY_ALERT' });
+      return true;
+    } catch (e) {
+      offscreenReady = null;
+      if (attempt === 2) { console.warn('[Instapoll] could not play sound', e); break; }
+      await new Promise((r) => setTimeout(r, 200));
+    }
   }
+  return false;
 }
 
 // ---------------------------------------------------------------------------
 // notification click -> focus the course tab, or open it
 // ---------------------------------------------------------------------------
-chrome.notifications.onClicked.addListener(async (notifId) => {
+async function consumeNotification(notifId) {
   chrome.notifications.clear(notifId);
   await loadState();
   // Fall back to the id itself: a notification can outlive the worker that
@@ -275,8 +366,10 @@ chrome.notifications.onClicked.addListener(async (notifId) => {
       : null;
   })();
   if (state.notifs[notifId]) { delete state.notifs[notifId]; await saveState(); }
-  if (!tgt) return;
+  return tgt;
+}
 
+async function focusCourseTab(tgt) {
   // Prefer focusing a live tab for this course.
   for (const [tabId, t] of Object.entries(state.tabs)) {
     if (t.courseId === tgt.courseId) {
@@ -288,6 +381,21 @@ chrome.notifications.onClicked.addListener(async (notifId) => {
     }
   }
   chrome.tabs.create({ url: tgt.url });
+}
+
+chrome.notifications.onClicked.addListener(async (notifId) => {
+  const tgt = await consumeNotification(notifId);
+  if (tgt) await focusCourseTab(tgt);
+});
+
+// Button 0 answers in the popup, button 1 goes to the course page. If the popup
+// cannot be opened (no focused window, or Chrome older than 127) fall through
+// to the course tab rather than doing nothing.
+chrome.notifications.onButtonClicked.addListener(async (notifId, index) => {
+  const tgt = await consumeNotification(notifId);
+  if (!tgt) return;
+  if (index === 0 && await openActionPopup()) return;
+  await focusCourseTab(tgt);
 });
 
 // ---------------------------------------------------------------------------
