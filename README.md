@@ -91,7 +91,7 @@ You have three independent checks:
 3. **Does frame parsing + dedup work?** Run the offline unit test against the
    real captured event:
    ```
-   node test/parse-test.mjs
+   for f in test/*.mjs; do node "$f"; done
    ```
    It asserts that the captured frame yields course `6609` / poll `229271`, that
    a repeat is rejected, and that distinct polls/courses are kept separate.
@@ -127,17 +127,31 @@ exercised live is an actual inbound `poll_released` — which #3 covers offline.
 | `content.js` | Reads the course ID from the tab URL and arms monitoring |
 | `offscreen.html` / `offscreen.js` | Plays the alert chime (service workers can't) |
 | `popup.html` / `popup.js` | Status view + test/reconnect buttons |
+| `poll-model.js` | Shared poll parsing/validation used by the popup and content script |
 | `test/parse-test.mjs` | Offline test of parsing + dedup |
+| `test/poll-api-test.mjs` | Content-script request/validation tests |
+| `test/popup-test.mjs` | Popup rendering and submit-flow tests |
+| `test/recovery-test.mjs` | Orphaned-tab repair, re-injection guard, no submit replay |
 | `icons/` | Toolbar & notification icons |
 
-**Permissions used:** `notifications`, `storage`, `alarms`, `offscreen`, and host
-access to `polls.la.utexas.edu` and `pusher-ws.la.utexas.edu`. No `tabs`
-permission — tab focusing uses the sender's own tab id.
+**Permissions used:** `notifications`, `storage`, `alarms`, `offscreen`,
+`scripting`, and host access to `polls.la.utexas.edu` and
+`pusher-ws.la.utexas.edu`. No `tabs` permission — tab focusing uses the sender's
+own tab id, and `scripting` is scoped to the two hosts above.
 
 ## Answer polls from the extension
 
-After updating the extension, reload it at chrome://extensions, then reload your
-signed-in Instapoll student course tabs so the new content script is available.
+Reload the extension at chrome://extensions and it repairs itself: the service
+worker re-injects the content script into course tabs that were already open.
+
+Chrome injects a manifest content script only when a page loads, so installing,
+updating or reloading the extension leaves every open course tab without one.
+That used to strand the popup on *"Reload your signed-in Instapoll course tab,
+then refresh polls"* — the tab was still visible to `tabs.query` and the status
+dot still read green from stored state, but no message could reach it. The
+worker now re-injects on install, startup and tab load, the popup asks it to
+repair a silent tab before giving up, and `content.js` refuses to initialise
+twice so a repaired tab never ends up with two message listeners.
 
 1. Open your course through Canvas and keep the student course tab open.
 2. Click the extension icon and select your course.

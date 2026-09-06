@@ -1,12 +1,23 @@
 // Requests run in the signed-in course tab so its normal session and CSRF
 // protection apply. No credentials or student responses are stored.
 (() => {
-  const match = location.pathname.match(/^\/course\/(\d+)\b/);
-  if (!match) return;
-  const courseId = match[1];
-  const base = '/api/v1/student/course/' + courseId + '/poll';
+  // The service worker re-injects this file into tabs that were already open
+  // when the extension loaded or updated. Registering the message listener
+  // twice would make one send resolve against two responders, so bail out if a
+  // live copy is already running in this frame.
+  if (globalThis.__instapollContent) return;
+  globalThis.__instapollContent = true;
+
+  // Instapoll routes client-side, so the course id is read at call time rather
+  // than captured at injection time: a tab injected on /course/6609 and then
+  // routed to /course/6609/student must keep answering for the current URL.
+  const currentCourseId = () => location.pathname.match(/^\/course\/(\d+)\b/)?.[1] || null;
   const pending = new Set();
+  let armed = null;
   function arm() {
+    const courseId = currentCourseId();
+    if (!courseId) return;
+    armed = courseId;
     chrome.runtime.sendMessage({ type: 'COURSE_ACTIVE', courseId, url: location.href },
       () => void chrome.runtime.lastError);
   }
@@ -14,6 +25,10 @@
   document.addEventListener('visibilitychange', () => {
     if (document.visibilityState === 'visible') arm();
   });
+  // Re-arm after client-side navigation so the worker never holds a stale course.
+  globalThis.navigation?.addEventListener?.('navigate', () => setTimeout(() => {
+    if (currentCourseId() !== armed) arm();
+  }, 0));
 
   async function request(path, body) {
     const headers = { Accept: 'application/json', 'X-Requested-With': 'XMLHttpRequest' };
@@ -48,11 +63,14 @@
 
   chrome.runtime.onMessage.addListener((msg, sender, respond) => {
     if (sender.id !== chrome.runtime.id || sender.tab ||
-        !['GET_POLLS', 'SUBMIT_POLL'].includes(msg.type)) return;
+        !['GET_POLLS', 'SUBMIT_POLL', 'PING'].includes(msg.type)) return;
+    const courseId = currentCourseId();
+    if (msg.type === 'PING') { respond({ ok: true, courseId }); return; }
     if (msg.courseId !== courseId || !/^\/course\/\d+\/student\/?$/.test(location.pathname)) {
       respond({ ok: false, error: 'Open the student course page to answer polls.' });
       return;
     }
+    const base = '/api/v1/student/course/' + courseId + '/poll';
     (async () => {
       if (msg.type === 'GET_POLLS') {
         const data = await request(base);

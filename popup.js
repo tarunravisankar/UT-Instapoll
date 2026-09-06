@@ -78,6 +78,16 @@ async function discover() {
     cards.clear(); $('polls').replaceChildren();
   }
 }
+// Ask the service worker to re-inject the content script into a tab that has
+// stopped answering. Manifest content scripts only load with the page, so a tab
+// that was already open when the extension installed, updated or reloaded has
+// none, and every message to it fails until the tab is reloaded by hand.
+async function heal(tabId) {
+  try {
+    const result = await chrome.runtime.sendMessage({ type: 'ENSURE_CONTENT', tabId });
+    return !!(result && result.ok);
+  } catch { return false; }
+}
 async function sendToCourse(courseId, payload, preferredTab) {
   const tabs = courses.get(courseId) || [];
   if (preferredTab !== undefined) {
@@ -89,6 +99,17 @@ async function sendToCourse(courseId, payload, preferredTab) {
       const result = await chrome.tabs.sendMessage(tab.id, { ...payload, courseId });
       if (result) return { ...result, tabId: tab.id };
     } catch {}
+  }
+  // Only reads are retried. A write that went unanswered may still have been
+  // accepted by Instapoll, so it must never be replayed automatically.
+  if (payload.type === 'GET_POLLS') {
+    for (const tab of tabs) {
+      if (!await heal(tab.id)) continue;
+      try {
+        const result = await chrome.tabs.sendMessage(tab.id, { ...payload, courseId });
+        if (result) return { ...result, tabId: tab.id };
+      } catch {}
+    }
   }
   throw new Error('Reload your signed-in Instapoll course tab, then refresh polls.');
 }

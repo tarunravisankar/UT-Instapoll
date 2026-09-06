@@ -8,7 +8,8 @@
     "notifications",
     "storage",
     "alarms",
-    "offscreen"
+    "offscreen",
+    "scripting"
   ],
   "host_permissions": [
     "*://polls.la.utexas.edu/*",

@@ -37,17 +37,30 @@ let lastEventAt = 0;
 
 // Persisted-ish state. `tabs` maps tabId -> {courseId, url, windowId}.
 // `seen` maps "courseId:pollId" -> timestamp (dedup across reloads/reconnects).
-let state = { tabs: {}, seen: {} };
+let state = { tabs: {}, seen: {}, notifs: {} };
 
-// notificationId -> {courseId, url} so clicks can focus/open the right tab
-const notifTargets = {};
+// notificationId -> {courseId, url} so clicks can focus/open the right tab.
+// Notifications use requireInteraction, so they outlive the service worker;
+// keeping targets only in memory made every click after a worker restart a
+// no-op. They live in `state.notifs` and are pruned with `seen`.
+const COURSE_URL_MATCH = '*://polls.la.utexas.edu/course/*';
+const CONTENT_FILES = ['poll-model.js', 'content.js'];
 
 // ---------------------------------------------------------------------------
 // persistence
 // ---------------------------------------------------------------------------
 async function loadState() {
   const got = await chrome.storage.local.get(STORAGE_KEY);
-  if (got[STORAGE_KEY]) state = { tabs: {}, seen: {}, ...got[STORAGE_KEY] };
+  const saved = got[STORAGE_KEY];
+  if (!saved) return;
+  // Merge instead of replacing. A COURSE_ACTIVE message can land while this
+  // read is in flight, and a wholesale replace silently dropped the tab that
+  // had just armed itself, leaving the worker monitoring nothing.
+  state = {
+    tabs: { ...(saved.tabs || {}), ...state.tabs },
+    seen: { ...(saved.seen || {}), ...state.seen },
+    notifs: { ...(saved.notifs || {}), ...state.notifs },
+  };
 }
 async function saveState() {
   await chrome.storage.local.set({ [STORAGE_KEY]: state });
@@ -62,6 +75,42 @@ function channelFor(courseId) {
 function courseIdFromChannel(channel) {
   const m = /^polls_course_(\d+)$/.exec(channel || '');
   return m ? m[1] : null;
+}
+
+// ---------------------------------------------------------------------------
+// content script health
+//
+// Manifest content scripts are injected only when a page loads. Installing,
+// updating or reloading the extension therefore leaves every already-open
+// course tab WITHOUT a content script, and nothing repaired it: the popup could
+// still see the tab via tabs.query and still show a green "connected" dot from
+// stored state, while every message to that tab failed with "Reload your
+// signed-in Instapoll course tab". Re-injecting here fixes those tabs in place.
+// content.js guards against running twice, so this is safe to repeat.
+// ---------------------------------------------------------------------------
+async function ensureContentScript(tabId) {
+  try {
+    const reply = await chrome.tabs.sendMessage(tabId, { type: 'PING' });
+    if (reply && reply.ok) return true;
+  } catch { /* no listener yet — inject below */ }
+  try {
+    await chrome.scripting.executeScript({
+      target: { tabId, allFrames: false },
+      files: CONTENT_FILES,
+      injectImmediately: true,
+    });
+    return true;
+  } catch (e) {
+    // Discarded, still loading, or a page we cannot touch. It will inject
+    // itself normally when it next loads.
+    return false;
+  }
+}
+
+async function healOpenTabs() {
+  let tabs = [];
+  try { tabs = await chrome.tabs.query({ url: COURSE_URL_MATCH }); } catch { return; }
+  await Promise.all(tabs.map((t) => t.id != null && ensureContentScript(t.id)));
 }
 
 // ---------------------------------------------------------------------------
@@ -168,7 +217,8 @@ async function handlePollReleased(frame) {
 async function notifyPoll(courseId, pollId) {
   const target = targetForCourse(courseId);
   const notifId = `instapoll_${courseId}_${pollId}_${Date.now()}`;
-  notifTargets[notifId] = { courseId, url: target.url };
+  state.notifs[notifId] = { courseId, url: target.url, at: Date.now() };
+  await saveState();
 
   chrome.notifications.create(notifId, {
     type: 'basic',
@@ -214,8 +264,17 @@ async function playAlertSound() {
 // notification click -> focus the course tab, or open it
 // ---------------------------------------------------------------------------
 chrome.notifications.onClicked.addListener(async (notifId) => {
-  const tgt = notifTargets[notifId];
   chrome.notifications.clear(notifId);
+  await loadState();
+  // Fall back to the id itself: a notification can outlive the worker that
+  // created it, and a click that opens nothing is worse than a best-effort one.
+  const tgt = state.notifs[notifId] || (() => {
+    const courseId = /^instapoll_(\d+)_/.exec(notifId)?.[1];
+    return courseId
+      ? { courseId, url: `https://polls.la.utexas.edu/course/${courseId}/student#` }
+      : null;
+  })();
+  if (state.notifs[notifId]) { delete state.notifs[notifId]; await saveState(); }
   if (!tgt) return;
 
   // Prefer focusing a live tab for this course.
@@ -248,8 +307,24 @@ function updateBadge() {
 // ---------------------------------------------------------------------------
 // messages from content scripts + popup
 // ---------------------------------------------------------------------------
+const HANDLED = new Set([
+  'COURSE_ACTIVE', 'GET_STATUS', 'TEST_ALERT', 'RECONNECT_NOW', 'ENSURE_CONTENT',
+]);
+
 chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
+  // Only claim the response port for our own message types. Returning true for
+  // everything also swallowed the offscreen audio messages, which left that
+  // send hanging until the port closed.
+  if (!msg || msg.target === 'offscreen' || !HANDLED.has(msg.type)) return false;
   (async () => {
+    if (msg.type === 'ENSURE_CONTENT') {
+      // The popup asks for this when a tab stops answering, so "Refresh polls"
+      // can repair the tab instead of telling the user to reload it by hand.
+      const tabId = Number(msg.tabId);
+      sendResponse({ ok: Number.isInteger(tabId) ? await ensureContentScript(tabId) : false });
+      return;
+    }
+
     if (msg.type === 'COURSE_ACTIVE') {
       const tab = sender.tab;
       if (tab && msg.courseId) {
@@ -313,6 +388,23 @@ function buildStatus() {
 // tab close -> drop course, maybe unsubscribe
 // (chrome.tabs.onRemoved works without the "tabs" permission)
 // ---------------------------------------------------------------------------
+// A reloaded or re-navigated tab gets a fresh content script from the manifest,
+// but a tab that leaves the course keeps its entry in state.tabs forever. That
+// stale entry kept the worker subscribed to a course the user no longer has
+// open and made the popup report "connected" for a tab that cannot answer.
+chrome.tabs.onUpdated.addListener(async (tabId, change, tab) => {
+  if (!change.url && change.status !== 'complete') return;
+  const onCourse = /^https?:\/\/polls\.la\.utexas\.edu\/course\/\d+\b/.test(tab.url || '');
+  if (!onCourse) {
+    if (!state.tabs[tabId]) return;
+    delete state.tabs[tabId];
+    await saveState();
+    updateBadge();
+    return;
+  }
+  if (change.status === 'complete') await ensureContentScript(tabId);
+});
+
 chrome.tabs.onRemoved.addListener(async (tabId) => {
   if (!state.tabs[tabId]) return;
   const courseId = state.tabs[tabId].courseId;
@@ -345,8 +437,12 @@ chrome.alarms.onAlarm.addListener(async (alarm) => {
   for (const [k, ts] of Object.entries(state.seen)) {
     if (now - ts > SEEN_TTL_MS) { delete state.seen[k]; changed = true; }
   }
+  for (const [k, t] of Object.entries(state.notifs)) {
+    if (now - (t.at || 0) > SEEN_TTL_MS) { delete state.notifs[k]; changed = true; }
+  }
   if (changed) await saveState();
 
+  await reconcileTabs();
   ensureConnection();
   updateBadge();
 });
@@ -361,10 +457,16 @@ async function reconcileTabs() {
   // Drop stored course tabs that no longer exist (e.g. closed while the SW was
   // terminated). chrome.tabs.query returns ids without the "tabs" permission.
   try {
-    const live = new Set((await chrome.tabs.query({})).map((t) => t.id));
+    // Keep only tabs that still exist AND are still on a course page. Matching
+    // on existence alone let a tab that navigated elsewhere keep a course armed.
+    const live = new Map();
+    for (const t of await chrome.tabs.query({})) live.set(t.id, t.url || '');
     let changed = false;
     for (const id of Object.keys(state.tabs)) {
-      if (!live.has(Number(id))) { delete state.tabs[id]; changed = true; }
+      const url = live.get(Number(id));
+      const onCourse = /^https?:\/\/polls\.la\.utexas\.edu\/course\/\d+\b/.test(url || '');
+      // An empty url means we cannot see it; keep the entry rather than guess.
+      if (url === undefined || (url && !onCourse)) { delete state.tabs[id]; changed = true; }
     }
     if (changed) await saveState();
   } catch { /* ignore */ }
@@ -375,6 +477,9 @@ async function init() {
   await reconcileTabs();
   ensureConnection();
   updateBadge();
+  // Repair course tabs that were already open when this extension version
+  // loaded. Without this they stay permanently unreachable from the popup.
+  await healOpenTabs();
 }
 
 // Debug hook — call from the service worker's DevTools console to push a
