@@ -31,5 +31,35 @@ globalThis.Instapoll = (() => {
   function revision(poll) {
     return JSON.stringify([poll.id, poll.released, poll.type, poll.prompt, poll.choices]);
   }
-  return { normalize, open, validate, revision, supported: type => types.has(type) };
+  // Rebuild a small allowlist of markup; never insert remote HTML directly.
+  // Keep question images and basic formatting; TeX is displayed as source text.
+  // Shared so the popup and the in-page overlay render prompts identically.
+  function promptFragment(html) {
+    const doc = new DOMParser().parseFromString(html, 'text/html');
+    const allowed = new Set(['P','BR','STRONG','B','EM','I','U','SUB','SUP','UL','OL','LI',
+      'BLOCKQUOTE','PRE','CODE','TABLE','TBODY','TR','TH','TD','DIV','SPAN']);
+    const dropped = new Set(['SCRIPT','STYLE','IFRAME','OBJECT','EMBED','FORM','INPUT','BUTTON','SVG','MATH']);
+    function copy(node, parent) {
+      if (node.nodeType === Node.TEXT_NODE) { parent.append(document.createTextNode(node.textContent)); return; }
+      if (node.nodeType !== Node.ELEMENT_NODE || dropped.has(node.tagName)) return;
+      if (node.tagName === 'IMG') {
+        try {
+          const url = new URL(node.getAttribute('src'), 'https://polls.la.utexas.edu');
+          if (url.protocol !== 'https:') return;
+          const img = document.createElement('img');
+          img.src = url.href; img.alt = node.getAttribute('alt') || 'Question image';
+          img.referrerPolicy = 'no-referrer';
+          parent.append(img);
+        } catch {}
+        return;
+      }
+      const target = allowed.has(node.tagName) ? document.createElement(node.tagName.toLowerCase()) : parent;
+      if (target !== parent) parent.append(target);
+      for (const child of node.childNodes) copy(child, target);
+    }
+    const fragment = document.createDocumentFragment();
+    for (const child of doc.body.childNodes) copy(child, fragment);
+    return fragment;
+  }
+  return { normalize, open, validate, revision, promptFragment, supported: type => types.has(type) };
 })();

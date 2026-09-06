@@ -14,6 +14,7 @@
   // routed to /course/6609/student must keep answering for the current URL.
   const currentCourseId = () => location.pathname.match(/^\/course\/(\d+)\b/)?.[1] || null;
   const pending = new Set();
+  const dismissed = new Set();
   let armed = null;
   let disposed = false;
 
@@ -24,6 +25,7 @@
   }
   function dispose() {
     disposed = true;
+    try { globalThis.InstapollOverlay?.destroy?.(); } catch {}
     document.removeEventListener('visibilitychange', onVisible);
     try { globalThis.navigation?.removeEventListener?.('navigate', onNavigate); } catch {}
     try { chrome.runtime.onMessage.removeListener(onMessage); } catch { /* context gone */ }
@@ -80,38 +82,64 @@
     return data;
   }
 
+  const apiBase = courseId => '/api/v1/student/course/' + courseId + '/poll';
+
+  async function fetchPolls(courseId) {
+    const data = await request(apiBase(courseId));
+    if (!Array.isArray(data)) throw new Error('Unexpected poll list. Open the course page.');
+    return data.map(Instapoll.normalize);
+  }
+
+  // One submit path for both the popup and the in-page card, so neither can
+  // drift from the re-read-and-compare check that guards against answering a
+  // question that changed underneath the reader.
+  async function submitAnswer(courseId, pollId, revision, answer) {
+    if (!/^\d+$/.test(String(pollId))) throw new Error('Invalid poll.');
+    const id = String(pollId);
+    const base = apiBase(courseId);
+    if (pending.has(id)) throw new Error('This answer is already being submitted.');
+    pending.add(id);
+    try {
+      const current = Instapoll.normalize(await request(base + '/' + id));
+      if (current.id !== id || (revision != null && Instapoll.revision(current) !== revision)) {
+        throw new Error('This question changed. Refresh before answering.');
+      }
+      const body = Instapoll.validate(current, answer);
+      const saved = Instapoll.normalize(await request(base + '/' + id + '/response', body));
+      if (saved.id !== id || !saved.submitted || saved.answer !== answer) {
+        throw new Error('Submission could not be confirmed. Check the course page before trying again.');
+      }
+      return saved;
+    } finally { pending.delete(id); }
+  }
+
+  // Show the released poll in a card on the page. Dismissed polls stay dismissed
+  // so a reader who closed one is not shown it again on the next worker nudge.
+  async function showPoll(courseId, pollId) {
+    const wanted = pollId != null ? String(pollId) : null;
+    const polls = await fetchPolls(courseId);
+    const poll = (wanted && polls.find(p => p.id === wanted && Instapoll.open(p)))
+      || polls.find(p => Instapoll.open(p));
+    if (!poll || dismissed.has(poll.id)) return;
+    InstapollOverlay.show(poll, {
+      submit: answer => submitAnswer(courseId, poll.id, Instapoll.revision(poll), answer),
+      onClose: () => dismissed.add(poll.id),
+    });
+  }
+
   function onMessage(msg, sender, respond) {
     if (disposed || !msg || sender.id !== chrome.runtime.id || sender.tab ||
-        !['GET_POLLS', 'SUBMIT_POLL', 'PING'].includes(msg.type)) return;
+        !['GET_POLLS', 'SUBMIT_POLL', 'SHOW_POLL', 'PING'].includes(msg.type)) return;
     const courseId = currentCourseId();
     if (msg.type === 'PING') { respond({ ok: true, courseId }); return; }
     if (msg.courseId !== courseId || !/^\/course\/\d+\/student\/?$/.test(location.pathname)) {
       respond({ ok: false, error: 'Open the student course page to answer polls.' });
       return;
     }
-    const base = '/api/v1/student/course/' + courseId + '/poll';
     (async () => {
-      if (msg.type === 'GET_POLLS') {
-        const data = await request(base);
-        if (!Array.isArray(data)) throw new Error('Unexpected poll list. Open the course page.');
-        return { ok: true, polls: data.map(Instapoll.normalize) };
-      }
-      if (!/^\d+$/.test(String(msg.pollId))) throw new Error('Invalid poll.');
-      const id = String(msg.pollId);
-      if (pending.has(id)) throw new Error('This answer is already being submitted.');
-      pending.add(id);
-      try {
-        const current = Instapoll.normalize(await request(base + '/' + id));
-        if (current.id !== id || Instapoll.revision(current) !== msg.revision) {
-          throw new Error('This question changed. Refresh before answering.');
-        }
-        const body = Instapoll.validate(current, msg.answer);
-        const saved = Instapoll.normalize(await request(base + '/' + id + '/response', body));
-        if (saved.id !== id || !saved.submitted || saved.answer !== msg.answer) {
-          throw new Error('Submission could not be confirmed. Check the course page before trying again.');
-        }
-        return { ok: true, poll: saved };
-      } finally { pending.delete(id); }
+      if (msg.type === 'GET_POLLS') return { ok: true, polls: await fetchPolls(courseId) };
+      if (msg.type === 'SHOW_POLL') { await showPoll(courseId, msg.pollId); return { ok: true }; }
+      return { ok: true, poll: await submitAnswer(courseId, msg.pollId, msg.revision, msg.answer) };
     })().then(reply, error => reply({ ok: false, error: error.message }));
     return true;
 

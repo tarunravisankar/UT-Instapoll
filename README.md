@@ -87,10 +87,20 @@ worker, not the page, so all of this fires from any tab, any window:
    the poll. This is deliberately *after* the alert — the alert is never delayed
    by a network round trip, and a poll with no reachable tab still alerts, just
    with the generic "a poll is open" wording.
-4. **The popup opens by itself** if Chrome already has focus, showing the
-   question and an answer form. This is best effort: `chrome.action.openPopup()`
+4. **A card opens on the course page** with the question and, for multiple
+   choice, the answer choices — for an open-ended poll, just the question and a
+   text box. It stays put while you click around, scroll, or let the page route
+   itself, and closes on its ✕ button or Escape. A poll you close stays closed.
+5. **The popup opens by itself** if Chrome already has focus, showing the same
+   question and answer form. This is best effort: `chrome.action.openPopup()`
    needs a focused Chrome window and Chrome 127+. When it can't run, the
-   notification is still there and still actionable.
+   notification and the in-page card are still there.
+
+> **Why a card in the page and not just the popup?** Chrome closes an action
+> popup the instant it loses focus — clicking anything on the page dismisses it,
+> and that is enforced by the browser, not by this extension. A node in the page
+> is the only kind of panel that can survive a click. It lives in a shadow root
+> so Instapoll's stylesheet cannot reach in and ours cannot leak out.
 
 > **macOS note:** Chrome hands notifications to the system Notification Center,
 > which does not honour `requireInteraction` — the banner auto-dismisses into
@@ -149,7 +159,8 @@ exercised live is an actual inbound `poll_released` — which #3 covers offline.
 |------|------|
 | `manifest.json` | MV3 manifest, minimal permissions |
 | `background.js` | Service worker: owns the WebSocket, dedup, notifications, click-to-focus, watchdog |
-| `content.js` | Reads the course ID from the tab URL and arms monitoring |
+| `content.js` | Arms monitoring, and fetches/submits polls from the signed-in tab |
+| `overlay.js` | The in-page poll card (shadow DOM), shown when a poll is released |
 | `offscreen.html` / `offscreen.js` | Plays the alert chime (service workers can't) |
 | `popup.html` / `popup.js` | Status view + test/reconnect buttons |
 | `poll-model.js` | Shared poll parsing/validation used by the popup and content script |
@@ -158,6 +169,7 @@ exercised live is an actual inbound `poll_released` — which #3 covers offline.
 | `test/popup-test.mjs` | Popup rendering and submit-flow tests |
 | `test/recovery-test.mjs` | Orphaned-tab repair, re-injection guard, no submit replay |
 | `test/alert-test.mjs` | Runs the real worker: chime, notification, question text, buttons |
+| `test/overlay-test.mjs` | The in-page card: choices, open ended, survives clicks, close, submit |
 | `icons/` | Toolbar & notification icons |
 
 **Permissions used:** `notifications`, `storage`, `alarms`, `offscreen`,

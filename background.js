@@ -44,7 +44,7 @@ let state = { tabs: {}, seen: {}, notifs: {} };
 // keeping targets only in memory made every click after a worker restart a
 // no-op. They live in `state.notifs` and are pruned with `seen`.
 const COURSE_URL_MATCH = '*://polls.la.utexas.edu/course/*';
-const CONTENT_FILES = ['poll-model.js', 'content.js'];
+const CONTENT_FILES = ['poll-model.js', 'overlay.js', 'content.js'];
 
 // ---------------------------------------------------------------------------
 // persistence
@@ -252,10 +252,26 @@ async function notifyPoll(courseId, pollId) {
   });
 
   await playAlertSound();
+  // Put the question on the course page itself. Unlike the action popup, a card
+  // in the page survives clicking around and closes only when asked to, so it
+  // is still there when the reader switches back to the tab.
+  await showPollInCourseTabs(courseId, pollId);
   // Surface the question without stealing the tab: this only lands when a
   // Chrome window already has focus, which is the "reading another tab" case.
   await openActionPopup();
   await describeInNotification(notifId, courseId, pollId);
+}
+
+async function showPollInCourseTabs(courseId, pollId) {
+  const tabIds = Object.entries(state.tabs)
+    .filter(([, t]) => t.courseId === courseId)
+    .map(([id]) => Number(id));
+  for (const tabId of tabIds) {
+    try {
+      if (!await ensureContentScript(tabId)) continue;
+      await chrome.tabs.sendMessage(tabId, { type: 'SHOW_POLL', courseId, pollId });
+    } catch { /* tab asleep or gone; the notification still stands */ }
+  }
 }
 
 // ---------------------------------------------------------------------------
