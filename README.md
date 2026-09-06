@@ -175,9 +175,17 @@ updating or reloading the extension leaves every open course tab without one.
 That used to strand the popup on *"Reload your signed-in Instapoll course tab,
 then refresh polls"* — the tab was still visible to `tabs.query` and the status
 dot still read green from stored state, but no message could reach it. The
-worker now re-injects on install, startup and tab load, the popup asks it to
-repair a silent tab before giving up, and `content.js` refuses to initialise
-twice so a repaired tab never ends up with two message listeners.
+worker now re-injects on install, startup and tab load, and the popup asks it to
+repair a silent tab before giving up.
+
+Reloading the extension does not detach the old content script either. The
+previous copy stays bound to the page with its listeners live and every
+`chrome.*` call dead, so it threw *"Extension context invalidated"* into the
+page on the next tab switch. A fresh copy is injected into the same isolated
+world, so `content.js` now hands over explicitly: the incoming copy calls
+`dispose()` on the outgoing one, which detaches its listeners, and any orphaned
+copy stands down on its own the first time it notices the context is gone.
+Exactly one live listener per frame, and a dead copy can never keep the tab.
 
 1. Open your course through Canvas and keep the student course tab open.
 2. Click the extension icon and select your course.

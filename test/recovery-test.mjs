@@ -13,16 +13,24 @@ const source = name => readFileSync(new URL('../' + name, import.meta.url), 'utf
 // content.js survives being injected twice
 // ---------------------------------------------------------------------------
 {
-  const listeners = [];
+  const live = new Set();
+  const docListeners = new Set();
   const context = vm.createContext({
     console, URL, AbortSignal, Set, Date, setTimeout,
     location: { pathname: '/course/6609/student', href: 'https://polls.la.utexas.edu/course/6609/student' },
-    document: { addEventListener() {}, querySelector: () => ({ content: 'csrf' }) },
+    document: {
+      addEventListener: (_n, fn) => docListeners.add(fn),
+      removeEventListener: (_n, fn) => docListeners.delete(fn),
+      querySelector: () => ({ content: 'csrf' }),
+    },
     chrome: {
       runtime: {
         id: 'ext',
         sendMessage(_msg, callback) { callback?.(); },
-        onMessage: { addListener: fn => listeners.push(fn) },
+        onMessage: {
+          addListener: fn => live.add(fn),
+          removeListener: fn => live.delete(fn),
+        },
       },
     },
     fetch: async () => ({ ok: true, status: 200, json: async () => [] }),
@@ -30,14 +38,72 @@ const source = name => readFileSync(new URL('../' + name, import.meta.url), 'utf
   vm.runInContext(source('poll-model.js'), context);
   vm.runInContext(source('content.js'), context);
   vm.runInContext(source('content.js'), context); // service worker re-injects
-  assert.equal(listeners.length, 1,
-    're-injection must not register a second message listener');
+  assert.equal(live.size, 1,
+    're-injection must leave exactly one live message listener');
+  assert.equal(docListeners.size, 1,
+    'the retired copy must detach its visibilitychange listener too');
 
   // A re-injected tab answers PING, which is how the worker verifies health.
   const ping = await new Promise(resolve =>
-    listeners[0]({ type: 'PING' }, { id: 'ext' }, resolve));
+    [...live][0]({ type: 'PING' }, { id: 'ext' }, resolve));
   assert.equal(ping.ok, true);
   assert.equal(ping.courseId, '6609');
+}
+
+// ---------------------------------------------------------------------------
+// An orphaned copy must stand down quietly, not throw
+//
+// Reloading the extension leaves the old content script attached to the page
+// with dead chrome.* APIs. Its visibilitychange handler still fires, and an
+// unguarded chrome.runtime.sendMessage there threw "Extension context
+// invalidated" into the page. It must also not block the replacement copy.
+// ---------------------------------------------------------------------------
+{
+  const live = new Set();
+  const docListeners = new Set();
+  let invalidated = false;
+  const runtime = {
+    get id() {
+      if (invalidated) throw new Error('Extension context invalidated.');
+      return 'ext';
+    },
+    sendMessage() {
+      if (invalidated) throw new Error('Extension context invalidated.');
+    },
+    onMessage: { addListener: fn => live.add(fn), removeListener: fn => live.delete(fn) },
+  };
+  const context = vm.createContext({
+    console, URL, AbortSignal, Set, Date, setTimeout,
+    location: { pathname: '/course/6609/student', href: 'https://polls.la.utexas.edu/course/6609/student' },
+    document: {
+      visibilityState: 'visible',
+      addEventListener: (_n, fn) => docListeners.add(fn),
+      removeEventListener: (_n, fn) => docListeners.delete(fn),
+      querySelector: () => ({ content: 'csrf' }),
+    },
+    chrome: { runtime },
+    fetch: async () => ({ ok: true, status: 200, json: async () => [] }),
+  });
+  vm.runInContext(source('poll-model.js'), context);
+  vm.runInContext(source('content.js'), context);
+  assert.equal(live.size, 1);
+  const orphan = [...live][0];
+
+  invalidated = true;                       // the extension reloads
+  const onVisible = [...docListeners][0];
+  assert.doesNotThrow(() => onVisible(),
+    'an orphaned copy must not throw "Extension context invalidated" into the page');
+  assert.equal(live.size, 0, 'an orphaned copy must retire its message listener');
+
+  invalidated = false;                      // the worker injects a fresh copy
+  vm.runInContext(source('content.js'), context);
+  assert.equal(live.size, 1,
+    'the replacement must start even though a dead copy marked the frame');
+  assert.notEqual([...live][0], orphan,
+    'the live listener must be the replacement, not the copy that was orphaned');
+  const ping = await new Promise(resolve =>
+    [...live][0]({ type: 'PING' }, { id: 'ext' }, resolve));
+  assert.equal(ping.ok, true, 'the replacement must answer the health check');
 }
 
 // ---------------------------------------------------------------------------

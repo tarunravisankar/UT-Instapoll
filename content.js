@@ -1,12 +1,13 @@
 // Requests run in the signed-in course tab so its normal session and CSRF
 // protection apply. No credentials or student responses are stored.
 (() => {
-  // The service worker re-injects this file into tabs that were already open
-  // when the extension loaded or updated. Registering the message listener
-  // twice would make one send resolve against two responders, so bail out if a
-  // live copy is already running in this frame.
-  if (globalThis.__instapollContent) return;
-  globalThis.__instapollContent = true;
+  // Reloading the extension does NOT detach this script: the previous copy stays
+  // bound to the page with its listeners live but every chrome.* call dead, and
+  // the worker then injects a fresh copy into the same isolated world. So retire
+  // the old copy and take over. Refusing to start when one is present would hand
+  // the page to a copy that can no longer reach the worker, which is exactly the
+  // stranded-tab failure this script is supposed to prevent.
+  try { globalThis.__instapollContent?.dispose?.(); } catch { /* already dead */ }
 
   // Instapoll routes client-side, so the course id is read at call time rather
   // than captured at injection time: a tab injected on /course/6609 and then
@@ -14,21 +15,39 @@
   const currentCourseId = () => location.pathname.match(/^\/course\/(\d+)\b/)?.[1] || null;
   const pending = new Set();
   let armed = null;
+  let disposed = false;
+
+  // An orphaned context reads chrome.runtime.id as undefined and throws
+  // "Extension context invalidated" from every chrome.* call.
+  function connected() {
+    try { return !!chrome.runtime?.id; } catch { return false; }
+  }
+  function dispose() {
+    disposed = true;
+    document.removeEventListener('visibilitychange', onVisible);
+    try { globalThis.navigation?.removeEventListener?.('navigate', onNavigate); } catch {}
+    try { chrome.runtime.onMessage.removeListener(onMessage); } catch { /* context gone */ }
+  }
   function arm() {
     const courseId = currentCourseId();
-    if (!courseId) return;
-    armed = courseId;
-    chrome.runtime.sendMessage({ type: 'COURSE_ACTIVE', courseId, url: location.href },
-      () => void chrome.runtime.lastError);
+    if (disposed || !courseId) return;
+    if (!connected()) { dispose(); return; }
+    try {
+      chrome.runtime.sendMessage({ type: 'COURSE_ACTIVE', courseId, url: location.href },
+        () => void chrome.runtime.lastError);
+      armed = courseId;
+    } catch {
+      // The extension reloaded under us. Stand down and let the fresh copy work.
+      dispose();
+    }
   }
-  arm();
-  document.addEventListener('visibilitychange', () => {
+  function onVisible() {
     if (document.visibilityState === 'visible') arm();
-  });
+  }
   // Re-arm after client-side navigation so the worker never holds a stale course.
-  globalThis.navigation?.addEventListener?.('navigate', () => setTimeout(() => {
-    if (currentCourseId() !== armed) arm();
-  }, 0));
+  function onNavigate() {
+    setTimeout(() => { if (currentCourseId() !== armed) arm(); }, 0);
+  }
 
   async function request(path, body) {
     const headers = { Accept: 'application/json', 'X-Requested-With': 'XMLHttpRequest' };
@@ -61,8 +80,8 @@
     return data;
   }
 
-  chrome.runtime.onMessage.addListener((msg, sender, respond) => {
-    if (sender.id !== chrome.runtime.id || sender.tab ||
+  function onMessage(msg, sender, respond) {
+    if (disposed || !msg || sender.id !== chrome.runtime.id || sender.tab ||
         !['GET_POLLS', 'SUBMIT_POLL', 'PING'].includes(msg.type)) return;
     const courseId = currentCourseId();
     if (msg.type === 'PING') { respond({ ok: true, courseId }); return; }
@@ -93,7 +112,19 @@
         }
         return { ok: true, poll: saved };
       } finally { pending.delete(id); }
-    })().then(respond, error => respond({ ok: false, error: error.message }));
+    })().then(reply, error => reply({ ok: false, error: error.message }));
     return true;
-  });
+
+    // The popup can close, and the extension can reload, while a request is in
+    // flight. Responding into a closed port throws; it is not worth surfacing.
+    function reply(value) {
+      try { respond(value); } catch { /* nobody is listening any more */ }
+    }
+  }
+
+  document.addEventListener('visibilitychange', onVisible);
+  try { globalThis.navigation?.addEventListener?.('navigate', onNavigate); } catch {}
+  chrome.runtime.onMessage.addListener(onMessage);
+  globalThis.__instapollContent = { dispose };
+  arm();
 })();
